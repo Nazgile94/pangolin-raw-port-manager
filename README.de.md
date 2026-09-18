@@ -64,8 +64,23 @@ Das Tool wurde ursprünglich für ein selbst gehostetes Setup im Stil von Pangol
 ## Installation
 
 ```bash
-unzip pangolin-raw-port-manager-v3.1.0.zip
+
+Clone die repository:
+
+git clone https://github.com/Nazgile94/pangolin-raw-port-manager.git
 cd pangolin-raw-port-manager
+sudo ./install.sh
+
+Dann starte das Programm:
+
+sudo pangolin-port
+Without Git
+
+Du kannst auch denCode als Zip Downloaden → Download ZIP on GitHub.
+
+Nach dem Entpacken:
+
+cd pangolin-raw-port-manager-main
 sudo ./install.sh
 ```
 
