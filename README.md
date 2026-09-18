@@ -64,8 +64,22 @@ No `yq` dependency is required.
 ## Installation
 
 ```bash
-unzip pangolin-raw-port-manager-v3.1.0.zip
+Clone the repository:
+
+git clone https://github.com/Nazgile94/pangolin-raw-port-manager.git
 cd pangolin-raw-port-manager
+sudo ./install.sh
+
+Then start the tool:
+
+sudo pangolin-port
+Without Git
+
+You can also use Code → Download ZIP on GitHub.
+
+After extracting the downloaded archive:
+
+cd pangolin-raw-port-manager-main
 sudo ./install.sh
 ```
 
