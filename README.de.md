@@ -166,3 +166,7 @@ Siehe [SECURITY.md](SECURITY.md).
 ## Lizenz
 
 MIT. Siehe [LICENSE](LICENSE).
+
+## KI-Transparenz
+
+Dieses Repository ist ausdrücklich ein **KI-unterstützt entwickeltes Community-Projekt**. Große Teile von Code, Egg, Workflows und Dokumentation wurden mit OpenAI ChatGPT erstellt oder überarbeitet. Der umgangssprachliche Begriff „Vibe Coding“ passt teilweise; wir verwenden im Projekt bevorzugt **AI-assisted development / KI-unterstützte Entwicklung**, weil menschliche Anforderungen, Tests und Entscheidungen Teil des Entwicklungsprozesses sind.
