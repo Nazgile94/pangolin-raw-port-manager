@@ -1,5 +1,7 @@
 # Pangolin Raw Port Manager
 
+<img width="742" height="653" alt="image" src="https://github.com/user-attachments/assets/a61fcf34-1693-4e7c-829a-491a0a885aed" />
+
 [Deutsch](README.de.md)
 
 Unofficial community helper for managing **Raw TCP/UDP listener ports** in a self-hosted Pangolin + Traefik Docker Compose setup.
