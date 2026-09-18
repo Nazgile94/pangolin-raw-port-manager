@@ -1,0 +1,98 @@
+name: Build downloadable ZIP
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ZIP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate Bash syntax
+        run: |
+          bash -n pangolin-port
+          bash -n lib/pangolin-port-en
+          bash -n lib/pangolin-port-de
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: Determine package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^VERSION=' pangolin-port | cut -d'"' -f2)"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+
+      - name: Build ZIP package
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE="pangolin-raw-port-manager-v${VERSION}"
+
+          rm -rf dist
+          mkdir -p "dist/${PACKAGE}"
+
+          cp -a \
+            pangolin-port \
+            lib \
+            install.sh \
+            uninstall.sh \
+            README.md \
+            README.de.md \
+            CHANGELOG.md \
+            SECURITY.md \
+            CONTRIBUTING.md \
+            LICENSE \
+            .gitignore \
+            "dist/${PACKAGE}/"
+
+          cd dist
+          zip -r "${PACKAGE}.zip" "${PACKAGE}"
+
+          echo
+          echo "Created:"
+          ls -lh "${PACKAGE}.zip"
+
+      - name: Upload ZIP as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pangolin-raw-port-manager-v${{ steps.version.outputs.version }}
+          path: dist/pangolin-raw-port-manager-v${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ZIP to GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP="dist/pangolin-raw-port-manager-v${VERSION}.zip"
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "$ZIP" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "$ZIP" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
