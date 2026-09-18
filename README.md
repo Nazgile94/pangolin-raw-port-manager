@@ -165,3 +165,9 @@ See [SECURITY.md](SECURITY.md).
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## AI transparency
+
+This repository is explicitly an **AI-assisted community project**. Large parts of the code, egg, workflows, and documentation were created or revised with OpenAI ChatGPT. The informal term “vibe coding” partly applies; this project prefers **AI-assisted development**, because human requirements, testing, and decisions remain part of the development process.
+
+See [AI-NOTICE.md](AI-NOTICE.md) for the full disclosure.
