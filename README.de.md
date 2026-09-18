@@ -1,4 +1,5 @@
 # Pangolin Raw Port Manager
+<img width="742" height="653" alt="image" src="https://github.com/user-attachments/assets/ef54590d-6fc1-4fbf-bf3a-fd67e56ac8cb" />
 
 [English](README.md)
 
