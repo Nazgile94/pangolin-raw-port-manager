@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="3.1.0"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -x "$SELF_DIR/lib/pangolin-port-en" ]]; then
+    LIB_DIR="$SELF_DIR/lib"
+else
+    LIB_DIR="/opt/pangolin/scripts/lib"
+fi
+
+APP_LANG=""
+ARGS=()
+HAS_COMMAND=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lang)
+            [[ $# -ge 2 ]] || {
+                echo "ERROR/FEHLER: --lang requires de or en." >&2
+                exit 1
+            }
+
+            case "${2,,}" in
+                de|en)
+                    APP_LANG="${2,,}"
+                    ;;
+                *)
+                    echo "ERROR/FEHLER: --lang must be de or en." >&2
+                    exit 1
+                    ;;
+            esac
+
+            shift 2
+            ;;
+
+        add|remove|list|doctor|-h|--help)
+            HAS_COMMAND=1
+            ARGS+=("$1")
+            shift
+            ;;
+
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$APP_LANG" ]]; then
+    if [[ "$HAS_COMMAND" -eq 0 && -t 0 ]]; then
+        echo
+        echo "Sprache wählen / Choose language"
+        echo "1) Deutsch"
+        echo "2) English"
+        echo
+
+        read -rp "Auswahl / Selection [1/2]: " choice
+
+        case "$choice" in
+            1|de|DE|Deutsch|deutsch)
+                APP_LANG="de"
+                ;;
+            *)
+                APP_LANG="en"
+                ;;
+        esac
+    else
+        LOCALE_VALUE="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+
+        if [[ "$LOCALE_VALUE" =~ ^de([_.-]|$) ]]; then
+            APP_LANG="de"
+        else
+            APP_LANG="en"
+        fi
+    fi
+fi
+
+IMPL="$LIB_DIR/pangolin-port-$APP_LANG"
+
+if [[ ! -x "$IMPL" ]]; then
+    echo "ERROR/FEHLER: Language implementation not found / Sprachdatei nicht gefunden: $IMPL" >&2
+    exit 1
+fi
+
+exec "$IMPL" "${ARGS[@]}"

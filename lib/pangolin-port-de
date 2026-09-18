@@ -1,0 +1,1213 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+VERSION="3.1.0"
+
+PANGOLIN_DIR="/opt/pangolin"
+ASSUME_YES=0
+COMMAND=""
+POSITIONAL=()
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+}
+
+ok() {
+    echo -e "${GREEN}[OK]${NC} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARNING]${NC} $*"
+}
+
+die() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    exit 1
+}
+
+usage() {
+cat <<'HELP'
+Pangolin Raw Port Manager v3.1.0
+
+Verwendung:
+
+  pangolin-port
+      Interaktives Menü
+
+  pangolin-port list
+      Raw-Ports inklusive Kommentare anzeigen
+
+  pangolin-port doctor
+      Konfiguration prüfen
+
+  pangolin-port add PORT tcp [KOMMENTAR]
+  pangolin-port add PORT udp [KOMMENTAR]
+  pangolin-port add PORT both [KOMMENTAR]
+
+  pangolin-port remove PORT tcp
+  pangolin-port remove PORT udp
+  pangolin-port remove PORT both
+
+Beispiele:
+
+  sudo pangolin-port
+
+  sudo pangolin-port list
+
+  sudo pangolin-port add 7777 tcp Terraria
+
+  sudo pangolin-port add 25565 tcp "Minecraft Server"
+
+  sudo pangolin-port add 8999 both "Test Server"
+
+  sudo pangolin-port remove 8999 both
+
+Optionen:
+
+  -y, --yes
+      Änderungen ohne Bestätigungsfrage anwenden
+
+  --dir PATH
+      Pangolin-Verzeichnis überschreiben
+      Standard: /opt/pangolin
+
+  -h, --help
+      Diese Hilfe anzeigen
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)
+            ASSUME_YES=1
+            shift
+            ;;
+
+        --dir)
+            [[ $# -ge 2 ]] || die "--dir benötigt einen Pfad."
+            PANGOLIN_DIR="$2"
+            shift 2
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        add|remove|list|doctor)
+            [[ -z "$COMMAND" ]] || die "Mehr als ein Kommando angegeben."
+            COMMAND="$1"
+            shift
+            ;;
+
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[[ ${EUID} -eq 0 ]] || die "Bitte mit sudo/root ausführen."
+
+command -v python3 >/dev/null 2>&1 || die "python3 wurde nicht gefunden."
+command -v docker >/dev/null 2>&1 || die "Docker wurde nicht gefunden."
+docker compose version >/dev/null 2>&1 || die "Docker Compose v2 wurde nicht gefunden."
+
+PANGOLIN_DIR="${PANGOLIN_DIR%/}"
+
+[[ -d "$PANGOLIN_DIR" ]] || die "Pangolin-Verzeichnis existiert nicht: $PANGOLIN_DIR"
+
+find_compose_file() {
+    local file
+
+    for file in \
+        docker-compose.yml \
+        docker-compose.yaml \
+        compose.yml \
+        compose.yaml
+    do
+        if [[ -f "$PANGOLIN_DIR/$file" ]]; then
+            echo "$PANGOLIN_DIR/$file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+COMPOSE_FILE="$(find_compose_file || true)"
+[[ -n "$COMPOSE_FILE" ]] || die "Keine Compose-Datei gefunden unter $PANGOLIN_DIR."
+
+TRAEFIK_CONFIG=""
+
+for file in \
+    "$PANGOLIN_DIR/config/traefik/traefik_config.yml" \
+    "$PANGOLIN_DIR/config/traefik/traefik_config.yaml"
+do
+    if [[ -f "$file" ]]; then
+        TRAEFIK_CONFIG="$file"
+        break
+    fi
+done
+
+[[ -n "$TRAEFIK_CONFIG" ]] || die "Traefik-Konfiguration wurde nicht gefunden."
+
+cd "$PANGOLIN_DIR"
+DC=(docker compose -f "$COMPOSE_FILE")
+
+"${DC[@]}" config -q || die "Die bestehende Docker-Compose-Konfiguration ist ungültig."
+
+detect_publish_service() {
+python3 - "$COMPOSE_FILE" <<'PY_DETECT'
+from pathlib import Path
+import re
+import sys
+
+text = Path(sys.argv[1]).read_text()
+
+if re.search(
+    r'^\s*network_mode:\s*["\']?service:gerbil["\']?\s*(?:#.*)?$',
+    text,
+    re.MULTILINE
+):
+    print("gerbil")
+else:
+    print("traefik")
+PY_DETECT
+}
+
+PUBLISH_SERVICE="$(detect_publish_service)"
+
+COMPOSE_SERVICES="$("${DC[@]}" config --services)"
+
+if ! grep -Fxq "$PUBLISH_SERVICE" <<< "$COMPOSE_SERVICES"; then
+    die "Service '$PUBLISH_SERVICE' wurde in Compose nicht gefunden."
+fi
+
+validate_port() {
+    local port="$1"
+
+    [[ "$port" =~ ^[0-9]+$ ]] || die "Ungültiger Port: $port"
+    (( port >= 1024 && port <= 65535 )) || die "Port muss zwischen 1024 und 65535 liegen."
+}
+
+normalize_protocol() {
+    case "${1,,}" in
+        tcp)
+            echo "tcp"
+            ;;
+        udp)
+            echo "udp"
+            ;;
+        both|tcp+udp|udp+tcp)
+            echo "both"
+            ;;
+        *)
+            die "Ungültiges Protokoll '$1'. Erlaubt: tcp, udp, both."
+            ;;
+    esac
+}
+
+list_ports() {
+    echo
+    echo "Konfigurierte Raw EntryPoints"
+    echo "--------------------------"
+
+python3 - "$TRAEFIK_CONFIG" "$COMPOSE_FILE" "$PUBLISH_SERVICE" <<'PY_LIST'
+from pathlib import Path
+import re
+import sys
+
+traefik_file = Path(sys.argv[1])
+compose_file = Path(sys.argv[2])
+service_name = sys.argv[3]
+
+traefik = traefik_file.read_text().splitlines()
+compose = compose_file.read_text().splitlines()
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+service_start = None
+service_indent = None
+
+for i, line in enumerate(compose):
+    m = re.match(
+        r'^(\s*)' + re.escape(service_name) + r':\s*(?:#.*)?$',
+        line
+    )
+    if m:
+        service_start = i
+        service_indent = len(m.group(1))
+        break
+
+service_end = len(compose)
+
+if service_start is not None:
+    for i in range(service_start + 1, len(compose)):
+        line = compose[i]
+
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+
+        if indent(line) <= service_indent:
+            service_end = i
+            break
+
+comments = {}
+
+port_pattern = re.compile(
+    r'^\s*-\s*["\']?'
+    r'(\d+):(\d+)'
+    r'(?:/(tcp|udp))?'
+    r'["\']?'
+    r'\s*(?:#\s*(.*))?$'
+)
+
+if service_start is not None:
+    for line in compose[service_start:service_end]:
+        m = port_pattern.match(line)
+
+        if not m:
+            continue
+
+        host_port = m.group(1)
+        proto = m.group(3) or "tcp"
+        comment = (m.group(4) or "").strip()
+
+        comments[(host_port, proto)] = comment
+
+entry_pattern = re.compile(
+    r'^\s*((tcp|udp)-(\d+)):\s*(?:#.*)?$'
+)
+
+address_pattern = re.compile(
+    r'^\s*address:\s*["\']?([^"\'#\s]+)["\']?\s*(?:#.*)?$'
+)
+
+entries = []
+
+current_name = None
+current_proto = None
+current_port = None
+
+for line in traefik:
+    m = entry_pattern.match(line)
+
+    if m:
+        current_name = m.group(1)
+        current_proto = m.group(2)
+        current_port = m.group(3)
+        continue
+
+    if current_name is None:
+        continue
+
+    m = address_pattern.match(line)
+
+    if m:
+        address = m.group(1).strip()
+        comment = comments.get((current_port, current_proto), "")
+
+        entries.append(
+            (
+                current_name,
+                address,
+                comment
+            )
+        )
+
+        current_name = None
+        current_proto = None
+        current_port = None
+
+if not entries:
+    print("Keine Raw TCP/UDP EntryPoints gefunden.")
+    print()
+    raise SystemExit(0)
+
+name_width = max(
+    22,
+    max(len(x[0]) for x in entries)
+)
+
+address_width = max(
+    20,
+    max(len(x[1]) for x in entries)
+)
+
+print(
+    f"{'ENTRYPOINT':<{name_width}} "
+    f"{'ADRESSE':<{address_width}} "
+    f"KOMMENTAR"
+)
+
+print(
+    f"{'-' * name_width} "
+    f"{'-' * address_width} "
+    f"{'-' * 35}"
+)
+
+for name, address, comment in entries:
+    print(
+        f"{name:<{name_width}} "
+        f"{address:<{address_width}} "
+        f"{comment}"
+    )
+
+print()
+PY_LIST
+}
+
+backup_configs() {
+    local backup_root="$PANGOLIN_DIR/.pangolin-port-backups"
+    BACKUP_DIR="$backup_root/$(date +'%Y%m%d-%H%M%S')"
+
+    mkdir -p "$backup_root"
+    chmod 700 "$backup_root"
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+
+    BACKUP_COMPOSE="$BACKUP_DIR/$(basename "$COMPOSE_FILE")"
+    BACKUP_TRAEFIK="$BACKUP_DIR/$(basename "$TRAEFIK_CONFIG")"
+
+    cp -a "$COMPOSE_FILE" "$BACKUP_COMPOSE"
+    cp -a "$TRAEFIK_CONFIG" "$BACKUP_TRAEFIK"
+
+    ok "Backup erstellt:"
+    echo "    $BACKUP_DIR"
+}
+
+rollback() {
+    warn "Vorherige Konfiguration wird wiederhergestellt..."
+
+    cp -a "$BACKUP_COMPOSE" "$COMPOSE_FILE"
+    cp -a "$BACKUP_TRAEFIK" "$TRAEFIK_CONFIG"
+
+    ok "Rollback abgeschlossen."
+}
+
+traefik_change() {
+    local action="$1"
+    local port="$2"
+    local proto="$3"
+
+python3 - "$TRAEFIK_CONFIG" "$action" "$port" "$proto" <<'PY_TRAEFIK'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+action = sys.argv[2]
+port = sys.argv[3]
+proto = sys.argv[4]
+
+name = f"{proto}-{port}"
+address = f":{port}/{proto}"
+
+lines = path.read_text().splitlines(True)
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+entrypoints_index = None
+base_indent = None
+
+for i, line in enumerate(lines):
+    m = re.match(
+        r'^(\s*)entryPoints:\s*(?:#.*)?$',
+        line
+    )
+
+    if m:
+        entrypoints_index = i
+        base_indent = len(m.group(1))
+        break
+
+if entrypoints_index is None:
+    raise SystemExit("entryPoints: wurde nicht gefunden.")
+
+entrypoints_end = len(lines)
+
+for i in range(entrypoints_index + 1, len(lines)):
+    line = lines[i]
+
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+
+    if indent(line) <= base_indent:
+        entrypoints_end = i
+        break
+
+child_indent = base_indent + 2
+
+for i in range(entrypoints_index + 1, entrypoints_end):
+    line = lines[i]
+
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+
+    if indent(line) > base_indent:
+        child_indent = indent(line)
+        break
+
+entry_regex = re.compile(
+    r'^'
+    + re.escape(" " * child_indent)
+    + re.escape(name)
+    + r':\s*(?:#.*)?$'
+)
+
+start = None
+
+for i in range(entrypoints_index + 1, entrypoints_end):
+    if entry_regex.match(lines[i]):
+        start = i
+        break
+
+if action == "add":
+    if start is not None:
+        stop = entrypoints_end
+
+        for i in range(start + 1, entrypoints_end):
+            line = lines[i]
+
+            if (
+                line.strip()
+                and not line.lstrip().startswith("#")
+                and indent(line) <= child_indent
+            ):
+                stop = i
+                break
+
+        existing_address = None
+
+        for line in lines[start + 1:stop]:
+            m = re.match(
+                r'^\s*address:\s*["\']?([^"\'#\s]+)',
+                line
+            )
+
+            if m:
+                existing_address = m.group(1).strip()
+                break
+
+        if existing_address and existing_address != address:
+            raise SystemExit(
+                f"{name} existiert bereits mit "
+                f"{existing_address}; erwartet: {address}"
+            )
+
+        print("EXISTS")
+        raise SystemExit(0)
+
+    insert_position = entrypoints_end
+
+    for i in range(entrypoints_index + 1, entrypoints_end):
+        if re.match(
+            r'^'
+            + re.escape(" " * child_indent)
+            + r'(web|websecure):\s*(?:#.*)?$',
+            lines[i]
+        ):
+            insert_position = i
+            break
+
+    block = [
+        f"{' ' * child_indent}{name}:\n",
+        f"{' ' * (child_indent + 2)}address: {address}\n",
+    ]
+
+    lines[insert_position:insert_position] = block
+    path.write_text("".join(lines))
+
+    print("ADDED")
+    raise SystemExit(0)
+
+if action == "remove":
+    if start is None:
+        print("MISSING")
+        raise SystemExit(0)
+
+    stop = entrypoints_end
+
+    for i in range(start + 1, entrypoints_end):
+        line = lines[i]
+
+        if (
+            line.strip()
+            and not line.lstrip().startswith("#")
+            and indent(line) <= child_indent
+        ):
+            stop = i
+            break
+
+    del lines[start:stop]
+    path.write_text("".join(lines))
+
+    print("REMOVED")
+    raise SystemExit(0)
+
+raise SystemExit(f"Unbekannte Aktion: {action}")
+PY_TRAEFIK
+}
+
+entry_has_extra_settings() {
+    local port="$1"
+    local proto="$2"
+
+python3 - "$TRAEFIK_CONFIG" "${proto}-${port}" <<'PY_EXTRA'
+from pathlib import Path
+import re
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+name = sys.argv[2]
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+start = None
+base = None
+
+for i, line in enumerate(lines):
+    if re.match(
+        r'^\s*' + re.escape(name) + r':\s*(?:#.*)?$',
+        line
+    ):
+        start = i
+        base = indent(line)
+        break
+
+if start is None:
+    raise SystemExit(1)
+
+extra = []
+
+for line in lines[start + 1:]:
+    if (
+        line.strip()
+        and not line.lstrip().startswith("#")
+        and indent(line) <= base
+    ):
+        break
+
+    stripped = line.strip()
+
+    if not stripped or stripped.startswith("#"):
+        continue
+
+    if stripped.startswith("address:"):
+        continue
+
+    extra.append(stripped)
+
+raise SystemExit(0 if extra else 1)
+PY_EXTRA
+}
+
+compose_change() {
+    local action="$1"
+    local port="$2"
+    local proto="$3"
+    local comment="${4:-}"
+
+python3 - \
+    "$COMPOSE_FILE" \
+    "$PUBLISH_SERVICE" \
+    "$action" \
+    "$port" \
+    "$proto" \
+    "$comment" <<'PY_COMPOSE'
+
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+service = sys.argv[2]
+action = sys.argv[3]
+port = sys.argv[4]
+proto = sys.argv[5]
+comment = sys.argv[6].strip()
+
+comment = re.sub(r'^\s*#\s*', '', comment)
+comment = comment.replace("\n", " ").replace("\r", " ").strip()
+
+lines = path.read_text().splitlines(True)
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+service_index = None
+service_indent = None
+
+for i, line in enumerate(lines):
+    m = re.match(
+        r'^(\s*)' + re.escape(service) + r':\s*(?:#.*)?$',
+        line
+    )
+
+    if m:
+        service_index = i
+        service_indent = len(m.group(1))
+        break
+
+if service_index is None:
+    raise SystemExit(f"Service '{service}' wurde nicht gefunden.")
+
+service_end = len(lines)
+
+for i in range(service_index + 1, len(lines)):
+    line = lines[i]
+
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+
+    if indent(line) <= service_indent:
+        service_end = i
+        break
+
+ports_index = None
+ports_indent = service_indent + 2
+
+for i in range(service_index + 1, service_end):
+    line = lines[i]
+
+    if (
+        re.match(r'^\s*ports:\s*(?:#.*)?$', line)
+        and indent(line) == service_indent + 2
+    ):
+        ports_index = i
+        ports_indent = indent(line)
+        break
+
+if ports_index is None:
+    if action == "remove":
+        print("MISSING")
+        raise SystemExit(0)
+
+    suffix = f" # {comment}" if comment else ""
+
+    block = [
+        f"{' ' * (service_indent + 2)}ports:\n",
+        f"{' ' * (service_indent + 4)}- {port}:{port}/{proto}{suffix}\n",
+    ]
+
+    lines[service_end:service_end] = block
+    path.write_text("".join(lines))
+
+    print("ADDED")
+    raise SystemExit(0)
+
+ports_end = service_end
+
+for i in range(ports_index + 1, service_end):
+    line = lines[i]
+
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+
+    if indent(line) <= ports_indent:
+        ports_end = i
+        break
+
+mapping_regex = re.compile(
+    r'^(\s*)-\s*["\']?'
+    + re.escape(port)
+    + r':'
+    + re.escape(port)
+    + r'(?:/(tcp|udp))?'
+    + r'["\']?'
+    + r'\s*(?:#\s*(.*))?$'
+)
+
+found_index = None
+found_indent = None
+found_comment = None
+
+for i in range(ports_index + 1, ports_end):
+    candidate = lines[i].rstrip("\n")
+    m = mapping_regex.match(candidate)
+
+    if not m:
+        continue
+
+    existing_proto = m.group(2) or "tcp"
+
+    if existing_proto != proto:
+        continue
+
+    found_index = i
+    found_indent = m.group(1)
+    found_comment = (m.group(3) or "").strip()
+
+    break
+
+if action == "add":
+    if found_index is not None:
+        if comment and comment != found_comment:
+            lines[found_index] = (
+                f"{found_indent}- "
+                f"{port}:{port}/{proto} "
+                f"# {comment}\n"
+            )
+
+            path.write_text("".join(lines))
+            print("UPDATED_KOMMENTAR")
+        else:
+            print("EXISTS")
+
+        raise SystemExit(0)
+
+    item_indent = ports_indent + 2
+
+    for i in range(ports_index + 1, ports_end):
+        m = re.match(r'^(\s*)-\s+', lines[i])
+
+        if m:
+            item_indent = len(m.group(1))
+            break
+
+    suffix = f" # {comment}" if comment else ""
+
+    lines[ports_end:ports_end] = [
+        f"{' ' * item_indent}- "
+        f"{port}:{port}/{proto}"
+        f"{suffix}\n"
+    ]
+
+    path.write_text("".join(lines))
+    print("ADDED")
+    raise SystemExit(0)
+
+if action == "remove":
+    if found_index is None:
+        print("MISSING")
+        raise SystemExit(0)
+
+    del lines[found_index]
+    path.write_text("".join(lines))
+
+    print("REMOVED")
+    raise SystemExit(0)
+
+raise SystemExit(f"Unbekannte Aktion: {action}")
+PY_COMPOSE
+}
+
+validate_configs() {
+    info "Prüfe Docker Compose..."
+
+    "${DC[@]}" config -q || return 1
+
+    info "Prüfe Traefik-Grundstruktur..."
+
+python3 - "$TRAEFIK_CONFIG" <<'PY_VALIDATE'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+
+if "entryPoints:" not in text:
+    raise SystemExit(1)
+
+if "\t" in text:
+    print("Tabs in Traefik-YAML gefunden.", file=sys.stderr)
+    raise SystemExit(1)
+PY_VALIDATE
+}
+
+show_diff() {
+    echo
+    echo "=== Docker Compose ==="
+
+    diff -u \
+        "$BACKUP_COMPOSE" \
+        "$COMPOSE_FILE" || true
+
+    echo
+    echo "=== Traefik ==="
+
+    diff -u \
+        "$BACKUP_TRAEFIK" \
+        "$TRAEFIK_CONFIG" || true
+
+    echo
+}
+
+restart_stack() {
+    local services=()
+
+    if [[ "$PUBLISH_SERVICE" != "traefik" ]]; then
+        services+=("$PUBLISH_SERVICE")
+    fi
+
+    services+=("traefik")
+
+    warn "Container werden neu erstellt: ${services[*]}"
+
+    "${DC[@]}" up \
+        -d \
+        --force-recreate \
+        "${services[@]}" \
+        || return 1
+
+    local service
+    local id
+    local running
+
+    for service in "${services[@]}"; do
+        id="$("${DC[@]}" ps -q "$service")"
+
+        [[ -n "$id" ]] || return 1
+
+        running="$(
+            docker inspect \
+                --format '{{.State.Running}}' \
+                "$id" 2>/dev/null || true
+        )"
+
+        [[ "$running" == "true" ]] || return 1
+    done
+
+    return 0
+}
+
+restart_after_rollback() {
+    local services=()
+
+    if [[ "$PUBLISH_SERVICE" != "traefik" ]]; then
+        services+=("$PUBLISH_SERVICE")
+    fi
+
+    services+=("traefik")
+
+    "${DC[@]}" up \
+        -d \
+        --force-recreate \
+        "${services[@]}" || true
+}
+
+perform_change() {
+    local action="$1"
+    local port="$2"
+    local protocol
+    local comment="${4:-}"
+
+    protocol="$(normalize_protocol "$3")"
+    validate_port "$port"
+
+    if [[ "$port" == "51820" || "$port" == "21820" ]]; then
+        warn "Port $port wird häufig von Pangolin/Gerbil verwendet."
+
+        if [[ "$ASSUME_YES" -eq 0 ]]; then
+            read -rp "Trotzdem fortfahren? [y/N]: " answer
+            [[ "$answer" =~ ^[Yy]$ ]] || exit 0
+        fi
+    fi
+
+    local protocols=()
+
+    if [[ "$protocol" == "both" ]]; then
+        protocols=("tcp" "udp")
+    else
+        protocols=("$protocol")
+    fi
+
+    if [[ "$action" == "remove" && "$ASSUME_YES" -eq 0 ]]; then
+        local p
+
+        for p in "${protocols[@]}"; do
+            if entry_has_extra_settings "$port" "$p"; then
+                warn "${p}-${port} enthält zusätzliche Traefik-Einstellungen."
+                warn "Der komplette EntryPoint-Block wird entfernt."
+
+                read -rp "${p}-${port} wirklich entfernen? [y/N]: " answer
+                [[ "$answer" =~ ^[Yy]$ ]] || exit 0
+            fi
+        done
+    fi
+
+    backup_configs
+
+    local p
+    local result
+
+    for p in "${protocols[@]}"; do
+        result="$(
+            traefik_change \
+                "$action" \
+                "$port" \
+                "$p"
+        )"
+
+        case "$result" in
+            ADDED)
+                ok "Traefik EntryPoint hinzugefügt: ${p}-${port}"
+                ;;
+            EXISTS)
+                info "Traefik EntryPoint ${p}-${port} existiert bereits."
+                ;;
+            REMOVED)
+                ok "Traefik EntryPoint entfernt: ${p}-${port}"
+                ;;
+            MISSING)
+                info "Traefik EntryPoint ${p}-${port} war nicht vorhanden."
+                ;;
+            *)
+                rollback
+                die "Traefik-Änderung fehlgeschlagen: $result"
+                ;;
+        esac
+
+        result="$(
+            compose_change \
+                "$action" \
+                "$port" \
+                "$p" \
+                "$comment"
+        )"
+
+        case "$result" in
+            ADDED)
+                ok "Docker-Mapping hinzugefügt: $port/$p"
+                ;;
+            EXISTS)
+                info "Docker mapping $port/$p existiert bereits."
+                ;;
+            UPDATED_KOMMENTAR)
+                ok "Kommentar aktualisiert für $port/$p."
+                ;;
+            REMOVED)
+                ok "Docker-Mapping entfernt: $port/$p"
+                ;;
+            MISSING)
+                info "Docker mapping $port/$p war nicht vorhanden."
+                ;;
+            *)
+                rollback
+                die "Compose-Änderung fehlgeschlagen: $result"
+                ;;
+        esac
+    done
+
+    if ! validate_configs; then
+        rollback
+        die "Die neue Konfiguration ist ungültig. Änderungen wurden zurückgerollt."
+    fi
+
+    show_diff
+
+    if [[ "$ASSUME_YES" -eq 0 ]]; then
+        read -rp \
+            "Änderungen anwenden und Gerbil/Traefik neu erstellen? [y/N]: " \
+            answer
+
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            rollback
+            ok "Keine Änderungen angewendet."
+            exit 0
+        fi
+    fi
+
+    if ! restart_stack; then
+        warn "Container-Neustart fehlgeschlagen."
+
+        echo
+        warn "Letzte Traefik-Logs:"
+        echo
+
+        "${DC[@]}" logs --tail=50 traefik || true
+
+        rollback
+
+        warn "Vorherige Konfiguration wird wiederhergestellt..."
+
+        restart_after_rollback
+
+        die "Änderung wurde zurückgerollt."
+    fi
+
+    echo
+    ok "Änderung erfolgreich angewendet."
+
+    list_ports
+
+    echo "Backup:"
+    echo "    $BACKUP_DIR"
+    echo
+}
+
+doctor() {
+    echo
+    echo "Pangolin Raw Port Manager v$VERSION"
+    echo "----------------------------------"
+    echo
+
+    echo "Pangolin-Verzeichnis : $PANGOLIN_DIR"
+    echo "Compose-Datei       : $COMPOSE_FILE"
+    echo "Traefik-Datei       : $TRAEFIK_CONFIG"
+    echo "Port-Publishing    : $PUBLISH_SERVICE"
+
+    echo
+
+    python3 --version
+    docker --version
+    docker compose version
+
+    echo
+
+    if "${DC[@]}" config -q; then
+        ok "Docker-Compose-Konfiguration ist gültig."
+    else
+        warn "Docker-Compose-Konfiguration ist ungültig."
+    fi
+
+    list_ports
+}
+
+interactive_menu() {
+    echo
+    echo "======================================"
+    echo " Pangolin Raw Port Manager v$VERSION"
+    echo "======================================"
+    echo
+    echo "1) Port hinzufügen"
+    echo "2) Port entfernen"
+    echo "3) Ports anzeigen"
+    echo "4) Doctor / Diagnose"
+    echo "5) Beenden"
+    echo
+
+    read -rp "Auswahl: " choice
+
+    case "$choice" in
+        1)
+            action="add"
+            ;;
+        2)
+            action="remove"
+            ;;
+        3)
+            list_ports
+            exit 0
+            ;;
+        4)
+            doctor
+            exit 0
+            ;;
+        5)
+            exit 0
+            ;;
+        *)
+            die "Ungültige Auswahl."
+            ;;
+    esac
+
+    echo
+    read -rp "Port (1024-65535): " port
+
+    echo
+    echo "1) TCP"
+    echo "2) UDP"
+    echo "3) TCP + UDP"
+    echo
+
+    read -rp "Protokoll: " protocol_choice
+
+    case "$protocol_choice" in
+        1)
+            protocol="tcp"
+            ;;
+        2)
+            protocol="udp"
+            ;;
+        3)
+            protocol="both"
+            ;;
+        *)
+            die "Ungültige Auswahl."
+            ;;
+    esac
+
+    comment=""
+
+    if [[ "$action" == "add" ]]; then
+        echo
+        read -rp \
+            "Kommentar/Beschreibung (optional): " \
+            comment
+    fi
+
+    perform_change \
+        "$action" \
+        "$port" \
+        "$protocol" \
+        "$comment"
+}
+
+info "Pangolin: $PANGOLIN_DIR"
+info "Compose:  $COMPOSE_FILE"
+info "Traefik:  $TRAEFIK_CONFIG"
+info "Port-Publishing via: $PUBLISH_SERVICE"
+
+if [[ -z "$COMMAND" ]]; then
+    interactive_menu
+    exit 0
+fi
+
+case "$COMMAND" in
+    list)
+        [[ ${#POSITIONAL[@]} -eq 0 ]] \
+            || die "Verwendung: pangolin-port list"
+
+        list_ports
+        ;;
+
+    doctor)
+        [[ ${#POSITIONAL[@]} -eq 0 ]] \
+            || die "Verwendung: pangolin-port doctor"
+
+        doctor
+        ;;
+
+    add)
+        [[ ${#POSITIONAL[@]} -ge 2 ]] \
+            || die 'Verwendung: pangolin-port add PORT tcp|udp|both [KOMMENTAR]'
+
+        PORT="${POSITIONAL[0]}"
+        PROTOCOL="${POSITIONAL[1]}"
+
+        if [[ ${#POSITIONAL[@]} -gt 2 ]]; then
+            KOMMENTAR="${POSITIONAL[*]:2}"
+        else
+            KOMMENTAR=""
+        fi
+
+        perform_change \
+            "add" \
+            "$PORT" \
+            "$PROTOCOL" \
+            "$KOMMENTAR"
+        ;;
+
+    remove)
+        [[ ${#POSITIONAL[@]} -eq 2 ]] \
+            || die "Verwendung: pangolin-port remove PORT tcp|udp|both"
+
+        perform_change \
+            "remove" \
+            "${POSITIONAL[0]}" \
+            "${POSITIONAL[1]}" \
+            ""
+        ;;
+esac
