@@ -19,10 +19,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Validate Bash syntax
+        shell: bash
         run: |
+          set -euo pipefail
           bash -n pangolin-port
           bash -n lib/pangolin-port-en
           bash -n lib/pangolin-port-de
@@ -33,18 +35,27 @@ jobs:
         id: version
         shell: bash
         run: |
+          set -euo pipefail
+
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
             VERSION="$(grep -m1 '^VERSION=' pangolin-port | cut -d'"' -f2)"
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Package version: $VERSION"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Could not determine package version." >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Package version: ${VERSION}"
 
       - name: Build ZIP package
         shell: bash
         run: |
+          set -euo pipefail
+
           VERSION="${{ steps.version.outputs.version }}"
           PACKAGE="pangolin-raw-port-manager-v${VERSION}"
 
@@ -65,34 +76,42 @@ jobs:
             .gitignore \
             "dist/${PACKAGE}/"
 
-          cd dist
-          zip -r "${PACKAGE}.zip" "${PACKAGE}"
+          (
+            cd dist
+            zip -r "${PACKAGE}.zip" "${PACKAGE}"
+          )
 
           echo
           echo "Created:"
-          ls -lh "${PACKAGE}.zip"
+          ls -lh "dist/${PACKAGE}.zip"
+          sha256sum "dist/${PACKAGE}.zip"
 
       - name: Upload ZIP as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: pangolin-raw-port-manager-v${{ steps.version.outputs.version }}
           path: dist/pangolin-raw-port-manager-v${{ steps.version.outputs.version }}.zip
+          archive: false
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload ZIP to GitHub Release
+      - name: Create or update GitHub Release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
+
           VERSION="${{ steps.version.outputs.version }}"
           ZIP="dist/pangolin-raw-port-manager-v${VERSION}.zip"
+          TAG="${GITHUB_REF_NAME}"
 
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "$ZIP" --clobber
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists. Replacing ZIP asset..."
+            gh release upload "${TAG}" "${ZIP}" --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" "$ZIP" \
-              --title "${GITHUB_REF_NAME}" \
+            echo "Creating release ${TAG}..."
+            gh release create "${TAG}" "${ZIP}" \
+              --title "${TAG}" \
               --generate-notes
           fi
